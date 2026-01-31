@@ -1,0 +1,187 @@
+#!/bin/sh
+# Init script for custom LFS Live ISO - Coreutils version (no BusyBox)
+# Auto-detect boot media, robust /proc mount handling
+
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+
+# Parse cmdline early for debug
+DEBUG=false
+rootdelay=
+
+log_msg() {
+  local msg="[INIT] $*"
+  echo "$msg" > /dev/kmsg 2>/dev/null || true
+  echo "$msg"
+}
+
+problem() {
+  log_msg "ERROR: Problem detected!"
+  printf "\nEncountered a problem!\nDropping to shell...\n\n"
+  /bin/sh
+}
+
+# Auto-detect boot device by scanning block devices and checking for squashfs file
+find_boot_device() {
+  local timeout=90
+  local count=0
+  local mnt_tmp="/tmpmnt"
+
+  log_msg "Auto-detecting boot media (timeout: ${timeout}s)..."
+  log_msg "Looking for /boot/lfs.squashfs on available devices..."
+
+  mkdir -p "$mnt_tmp" 2>/dev/null
+
+  while [ $count -lt $timeout ]; do
+    for dev in $(lsblk -pnlo NAME); do
+      if [ -b "$dev" ]; then
+        log_msg "Probing device $dev..."
+
+        if mount -t auto -o ro "$dev" "$mnt_tmp" 2>/dev/null; then
+          if [ -f "$mnt_tmp/boot/lfs.squashfs" ]; then
+            device="$dev"
+            log_msg "Boot media DETECTED on $dev (found /boot/lfs.squashfs)"
+            # Keep mounted, move later
+            return 0
+          else
+            umount "$mnt_tmp" 2>/dev/null
+          fi
+        fi
+      fi
+    done
+
+    sleep 2
+    count=$((count + 2))
+    [ $((count % 10)) -eq 0 ] && log_msg "Still scanning... (${count}s)"
+  done
+
+  log_msg "ERROR: No valid boot media found after ${timeout}s"
+  blkid
+  lsblk -f 2>/dev/null || true
+  problem
+  return 1
+}
+
+do_mount_root() {
+  log_msg "Mounting root filesystem (squashfs + overlay)"
+
+  # Load key modules
+  modprobe -q squashfs || true 
+  modprobe -q overlay || true
+  modprobe -q loop || true
+  modprobe -q vfat || true
+  modprobe -q iso9660 || true
+  modprobe -q usb-storage || true
+  modprobe -q sr_mod || true
+  modprobe -q xhci_hcd || true
+  modprobe -q ehci_hcd || true
+  modprobe -q uhci_hcd || true
+  
+  mkdir -p /.root /mnt /squash /cow/mod /cow/buffer
+
+  # Ensure loop device
+  [ -b /dev/loop0 ] || mknod /dev/loop0 b 7 0
+
+  # Auto-detect and mount boot media
+  if ! find_boot_device; then
+    return 1
+  fi
+
+  # Move or mount to /mnt
+  if mountpoint -q "$mnt_tmp"; then
+    mount --move "$mnt_tmp" /mnt || problem
+  else
+    mount -t auto "$device" /mnt || { log_msg "Mount $device failed"; problem; }
+  fi
+  log_msg "Boot media mounted at /mnt"
+
+  # Verify squashfs file
+  [ -f /mnt/boot/lfs.squashfs ] || { log_msg "lfs.squashfs missing!"; ls -la /mnt/boot/; problem; }
+
+  # Mount squashfs (read-only)
+  mount -t squashfs -o loop /mnt/boot/lfs.squashfs /squash || problem
+  log_msg "squashfs mounted at /squash"
+
+  # Tmpfs for cow/overlay
+  mount -t tmpfs tmpfs /cow || problem
+
+  mkdir -p /cow/mod /cow/buffer
+
+  # Overlay mount
+  mount -t overlay -o lowerdir=/squash,upperdir=/cow/mod,workdir=/cow/buffer overlay /.root || problem
+  log_msg "Overlay mounted at /.root"
+
+  # Bind mounts for persistence/access
+  mkdir -p /.root/mnt/changes /.root/mnt/container
+  mount --bind /cow/mod /.root/mnt/changes
+  mount --bind /mnt /.root/mnt/container
+
+  log_msg "Root filesystem prepared!"
+}
+
+# ===================== MAIN =====================
+
+log_msg "=== Custom LFS Live ISO Init Starting ==="
+
+# Create essential dirs
+mkdir -p /proc /sys /dev /run /tmp 2>/dev/null
+
+# Mount pseudo-fs with strict checks
+log_msg "Mounting pseudo-filesystems..."
+
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || { log_msg "devtmpfs failed"; /bin/sh; }
+mount -t proc proc /proc || { log_msg "CRITICAL: proc mount failed!"; /bin/sh; }
+mount -t sysfs sysfs /sys 2>/dev/null || log_msg "sysfs mount failed (non-fatal)"
+mount -t tmpfs tmpfs /run 2>/dev/null || log_msg "tmpfs /run failed (non-fatal)"
+
+# Critical: Ensure /proc/cmdline exists
+if [ ! -r /proc/cmdline ]; then
+  log_msg "WARNING: /proc/cmdline missing - remounting /proc"
+  umount /proc 2>/dev/null
+  mount -t proc proc /proc || { log_msg "Cannot remount /proc!"; /bin/sh; }
+fi
+
+
+# Read cmdline safely
+cmdline=$(cat /proc/cmdline 2>/dev/null || echo "")
+log_msg "Kernel cmdline: $cmdline"
+
+# Parse parameters
+for param in $cmdline; do
+  case $param in
+    debug) DEBUG=true ;;
+    rootdelay=*) rootdelay=${param#rootdelay=} ;;
+  esac
+done
+
+# Start udev
+log_msg "Starting udev..."
+UDEVD=""
+for p in /sbin/udevd /usr/sbin/udevd /lib/udev/udevd /usr/lib/udev/udevd; do
+  [ -x "$p" ] && UDEVD="$p" && break
+done
+[ -z "$UDEVD" ] && { log_msg "udevd not found"; problem; }
+udevadm trigger --action=add
+$UDEVD --daemon --resolve-names=never
+udevadm trigger
+udevadm settle --timeout=30
+
+log_msg "udev ready"
+
+# Apply rootdelay
+[ -n "$rootdelay" ] && { log_msg "rootdelay ${rootdelay}s"; sleep "$rootdelay"; }
+
+# Mount root
+do_mount_root || problem
+
+# Cleanup udev
+log_msg "Stopping udev..."
+killall -w udevd 2>/dev/null || true
+
+# Switch root
+log_msg "Switching to new root..."
+exec switch_root /.root /sbin/init "$@"
+
+# Fallback if switch fails
+log_msg "FATAL: switch_root failed!"
+problem
